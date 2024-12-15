@@ -7,6 +7,9 @@
 #include <algorithm>
 #include <csignal>
 
+using shm_spmc::idx_t;
+using shm_spmc::SVShmCircularBuffer;
+
 enum { MAX_KLINE_MSG_SIZE = 400 };
 
 struct KlineData {
@@ -14,10 +17,12 @@ struct KlineData {
 };
 
 typedef websocketpp::client<websocketpp::config::asio_tls_client> WebSocketClient;
+typedef SVShmCircularBuffer<KlineData, /* IsProducer: */ true> SVShmProducer;
+typedef SVShmCircularBuffer<KlineData, /* IsProducer: */ false> SVShmConsumer;
 
 class BinanceKlineClient {
 public:
-    BinanceKlineClient(ShmCircularBuffer<KlineData, /* IsProducer: */ true> &shm_bbuffer)
+    BinanceKlineClient(SVShmCircularBuffer<KlineData, /* IsProducer: */ true> &shm_bbuffer)
         : shm_bbuffer_(shm_bbuffer) {
         wsclient_.init_asio();
         wsclient_.set_tls_init_handler([](websocketpp::connection_hdl hdl) {
@@ -68,12 +73,12 @@ private:
         print_kline_data(message);
     }
 
-    ShmCircularBuffer<KlineData, /* IsProducer: */ true> &shm_bbuffer_;
+    SVShmProducer &shm_bbuffer_;
     WebSocketClient wsclient_;
 };
 
-void run_producer(const char *shm_name, idx_t capacity) {
-    ShmCircularBuffer<KlineData, /* IsProducer: */ true> shm_bbuffer(shm_name, capacity);
+void run_producer(int shm_key, idx_t capacity) {
+    SVShmProducer shm_bbuffer(shm_key, capacity, /* shm_id: */ -1, /* use_huge_pages: */ true);
     BinanceKlineClient client(shm_bbuffer);
 
     const std::string uri = "wss://stream.binance.com:9443/ws/btcusdt@kline_1m";
@@ -83,9 +88,8 @@ void run_producer(const char *shm_name, idx_t capacity) {
     client.run();
 }
 
-void run_consumer(const char *shm_name) {
-    ShmCircularBuffer<KlineData, /* IsProducer: */ false> shm_bbuffer(shm_name);
-
+void run_consumer(int shm_id, idx_t capacity) {
+    SVShmConsumer shm_bbuffer(0, capacity, shm_id, /* use_huge_pages: */ true);
     KlineData item;
     while (true) {
         shm_bbuffer.consume(&item);
@@ -95,32 +99,27 @@ void run_consumer(const char *shm_name) {
 }
 
 void print_usage_and_exit(const char *app) {
-    std::cerr << "Usage: \n"
-              << app << " producer /shm_name capacity\n"
-              << app << " consumer /shm_name\n";
+    std::cerr << "Usage:\n"
+              << app << " producer shm_key capacity\n"
+              << app << " consumer shm_id capacity\n";
     exit(EXIT_FAILURE);
 }
 
 int main(int argc, const char *argv[]) {
     const char *app = argv[0];
-    if (argc == 1)
+    if (argc != 4)
         print_usage_and_exit(app);
     const std::string app_kind = argv[1];
+    const int shm_key_or_id = std::stod(argv[2]);
+    const idx_t capacity = std::stod(argv[3]);
+    if (capacity <= 0) {
+        std::cerr << "invalid capacity\n";
+        exit(EXIT_FAILURE);
+    }
     if (app_kind == "producer") {
-        if (argc != 4)
-            print_usage_and_exit(app);
-        idx_t capacity = std::stod(argv[3]);
-        if (capacity <= 0) {
-            std::cerr << "invalid capacity\n";
-            exit(EXIT_FAILURE);
-        }
-        const char *shm_name = argv[2];
-        run_producer(shm_name, capacity);
+        run_producer(shm_key_or_id, capacity);
     } else if (app_kind == "consumer") {
-        if (argc != 3)
-            print_usage_and_exit(app);
-        const char *shm_name = argv[2];
-        run_consumer(shm_name);
+        run_consumer(shm_key_or_id, capacity);
     } else {
         print_usage_and_exit(app);
     }

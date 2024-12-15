@@ -9,6 +9,7 @@ IndentWidth: 4
 TabWidth: 4
 IndentCaseLabels: false
 SortIncludes: false
+SortUsingDeclarations: false
 AllowShortIfStatementsOnASingleLine: false
 AllowShortLoopsOnASingleLine: false
 AllowShortCaseLabelsOnASingleLine: false
