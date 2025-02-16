@@ -110,8 +110,8 @@ int main(int argc, const char *argv[]) {
     if (argc != 4)
         print_usage_and_exit(app);
     const std::string app_kind = argv[1];
-    const int shm_key_or_id = std::stod(argv[2]);
-    const idx_t capacity = std::stod(argv[3]);
+    const int shm_key_or_id = std::stoi(argv[2]);
+    const idx_t capacity = std::stoul(argv[3]);
     if (capacity <= 0) {
         std::cerr << "invalid capacity\n";
         exit(EXIT_FAILURE);
