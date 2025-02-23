@@ -305,8 +305,18 @@ public:
             if (cb_->tail_.load(std::memory_order_relaxed) == head_)
                 return CONSUME_FINISHED;
         } else {
+#if 1
+            // If the reader is slower than the writer, caching the tail can significantly
+            // reduce the # of loads of `tail_`, which the writer updates frequently.
+            if (head_ == cached_tail_) {
+                cached_tail_ = cb_->tail_.load(std::memory_order_acquire);
+                if (head_ == cached_tail_)
+                    return CONSUME_AGAIN;
+            }
+#else
             if (cb_->tail_.load(std::memory_order_acquire) == head_)
                 return CONSUME_AGAIN;
+#endif
         }
 
         memcpy(&item, &buffer_[head_], sizeof item);
@@ -321,6 +331,7 @@ private:
     ShmControlBlockLockFree *cb_;
     T *buffer_;
     idx_t head_ = 0;
+    idx_t cached_tail_ = 0;
 };
 
 }  // namespace shm_spmc
