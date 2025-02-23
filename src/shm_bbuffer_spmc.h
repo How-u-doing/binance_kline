@@ -408,7 +408,7 @@ public:
         static_assert(!IsProducer, "can only be called from consumers");
 
         if (cb_->writer_finished_) {
-            if (!produced_[head_].load(std::memory_order_relaxed))
+            if (head_ == cb_->cap_ || !produced_[head_].load(std::memory_order_relaxed))
                 return CONSUME_FINISHED;
         } else {
             // no cache line bouncing unless head_ and tail_ are pointing to the same cache line
