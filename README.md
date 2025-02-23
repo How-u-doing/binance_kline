@@ -1,4 +1,4 @@
-## Single-Producer Multiple-Consumer Bounded Buffer
+## Single-Producer Multi-Consumer Bounded Buffer
 ```bash
 $ make check_huge_pages_info
 cat /proc/meminfo | grep Huge

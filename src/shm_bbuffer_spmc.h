@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+#include <new>
 #include <string>
 #include <type_traits>
 #include <cassert>
@@ -20,9 +22,32 @@
         exit(EXIT_FAILURE); \
     } while (0)
 
+#define likely(x) __builtin_expect(!!(x), 1)
+#define unlikely(x) __builtin_expect(!!(x), 0)
+
+#ifdef __x86_64__
+#define load_fence() asm volatile("lfence" ::: "memory")
+#elif __aarch64__
+#define load_fence() asm volatile("dmb ishld" ::: "memory")
+#else
+#define load_fence()
+#endif
+
+#ifdef __cpp_lib_hardware_interference_size
+#define CACHELINE_ALIGNED alignas(std::hardware_destructive_interference_size)
+#else
+// 64 bytes on x86-64 | L1_CACHE_BYTES | L1_CACHE_SHIFT | __cacheline_aligned | ...
+#define CACHELINE_ALIGNED alignas(64)
+#endif
+
+#define CONSUME_SUCCESS 1
+#define CONSUME_AGAIN 0
+#define CONSUME_FINISHED -1
+
 namespace shm_spmc {
 
-typedef unsigned idx_t;
+typedef unsigned long idx_t;
+
 struct ShmControlBlock {
     sem_t mutex;
     sem_t full;
@@ -32,7 +57,7 @@ struct ShmControlBlock {
     idx_t len;
 };
 
-// Single-producer multiple-consumer bounded buffer using shared memory.
+// Single-producer multi-consumer bounded buffer using shared memory.
 // see also https://en.wikipedia.org/wiki/Producer-consumer_problem
 template <typename T, bool IsProducer>
 class ShmCircularBufferBase {
@@ -92,7 +117,7 @@ protected:
     T *buffer_;
 };
 
-// Single-producer multiple-consumer bounded buffer using POSIX shared memory.
+// Single-producer multi-consumer bounded buffer using POSIX shared memory.
 template <typename T, bool IsProducer>
 class PShmCircularBuffer : ShmCircularBufferBase<T, IsProducer> {
     using base_ = ShmCircularBufferBase<T, IsProducer>;
@@ -144,7 +169,7 @@ private:
     const std::string shm_name_;
 };
 
-// Single-producer multiple-consumer bounded buffer using System V shared memory.
+// Single-producer multi-consumer bounded buffer using System V shared memory.
 template <typename T, bool IsProducer>
 class SVShmCircularBuffer : ShmCircularBufferBase<T, IsProducer> {
     using base_ = ShmCircularBufferBase<T, IsProducer>;
@@ -198,6 +223,104 @@ public:
 
 private:
     int shm_id_;
+};
+
+struct ShmControlBlockLockFree {
+    idx_t cap_;
+    std::atomic<idx_t> tail_;
+    CACHELINE_ALIGNED bool writer_finished_;
+};
+
+// The producer operates on the shared tail and the consumers operate on their own local head.
+template <typename T, bool IsProducer>
+class PShmBBufferLockFree {
+public:
+    explicit PShmBBufferLockFree(const char *shm_name, idx_t capacity = 0) : shm_name_(shm_name) {
+        static_assert(std::is_trivially_copyable_v<T>, "T must be trivially copyable");
+
+        int shm_fd = -1;
+        if constexpr (IsProducer) {
+            shm_fd = shm_open(shm_name, O_CREAT | O_EXCL | O_RDWR, 0600);
+        } else {
+            shm_fd = shm_open(shm_name, O_RDONLY, 0600);
+        }
+        if (shm_fd == -1)
+            handle_error("shm_open");
+
+        size_t shm_size = sizeof(ShmControlBlockLockFree) + sizeof(T) * capacity;
+        if constexpr (IsProducer) {
+            if (ftruncate(shm_fd, shm_size) == -1)
+                handle_error("ftruncate");
+        } else {
+            // consumer can read the capacity from the shared memory
+            ssize_t nbytes = read(shm_fd, &capacity, sizeof capacity);
+            assert(nbytes == sizeof capacity);
+            shm_size = sizeof(ShmControlBlockLockFree) + sizeof(T) * capacity;
+        }
+
+        int write_flag = IsProducer ? PROT_WRITE : 0;
+        void *shmp = mmap(nullptr, shm_size, PROT_READ | write_flag, MAP_SHARED, shm_fd, 0);
+        if (shmp == MAP_FAILED)
+            handle_error("mmap");
+
+        // initialize the shared memory control block and buffer pointer
+        cb_ = static_cast<ShmControlBlockLockFree *>(shmp);
+        if constexpr (IsProducer) {
+            cb_->cap_ = capacity;
+            cb_->tail_.store(0, std::memory_order_relaxed);
+        }
+        buffer_ =
+            reinterpret_cast<T *>(static_cast<char *>(shmp) + sizeof(ShmControlBlockLockFree));
+    }
+
+    ~PShmBBufferLockFree() {
+        if constexpr (IsProducer) {
+            // destroys the shared object only when all processes have unmapped it
+            shm_unlink(shm_name_.c_str());
+            this->cb_->writer_finished_ = true;
+        }
+        munmap(this->cb_, sizeof(ShmControlBlockLockFree) + sizeof(T) * this->cb_->cap_);
+    }
+
+    // producer appends an item to the buffer tail
+    // returns false if the buffer is full
+    bool produce(const T &item) {
+        static_assert(IsProducer, "can only be called from producers");
+
+        idx_t tail = cb_->tail_.load(std::memory_order_relaxed);
+        if (tail == cb_->cap_)
+            return false;
+
+        memcpy(&buffer_[tail], &item, sizeof item);
+        cb_->tail_.store(tail + 1, std::memory_order_release);
+        return true;
+    }
+
+    // consumer retrieves an item from the buffer head
+    int consume(T &item) {
+        static_assert(!IsProducer, "can only be called from consumers");
+        if (cb_->writer_finished_) {
+            // insert a memory barrier to prevent speculative loads
+            // load_fence();
+            if (cb_->tail_.load(std::memory_order_relaxed) == head_)
+                return CONSUME_FINISHED;
+        } else {
+            if (cb_->tail_.load(std::memory_order_acquire) == head_)
+                return CONSUME_AGAIN;
+        }
+
+        memcpy(&item, &buffer_[head_], sizeof item);
+        head_++;
+        return CONSUME_SUCCESS;
+    }
+
+    idx_t capacity() const { return cb_->cap_; }
+
+private:
+    const std::string shm_name_;
+    ShmControlBlockLockFree *cb_;
+    T *buffer_;
+    idx_t head_ = 0;
 };
 
 }  // namespace shm_spmc
