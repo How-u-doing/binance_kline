@@ -72,7 +72,8 @@ void update_factor(StatMap &stat, const KLineData &kline) {
 }
 
 template <typename T>
-using ShmConsumer = shm_spmc::PShmBBufferLockFree<T, /* IsProducer = */ false>;
+// using ShmConsumer = shm_spmc::PShmBBufferLockFree<T, /* IsProducer = */ false>;
+using ShmConsumer = shm_spmc::PShmBBufferGiacomoni<T, /* IsProducer = */ false>;
 
 int main(int argc, char *argv[]) {
     if (argc < 3) {

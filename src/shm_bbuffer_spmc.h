@@ -110,7 +110,7 @@ protected:
             cb_->head = 0;
             cb_->len = 0;
         }
-        buffer_ = reinterpret_cast<T *>(static_cast<char *>(shmp) + sizeof(ShmControlBlock));
+        buffer_ = reinterpret_cast<T *>(static_cast<char *>(shmp) + sizeof *cb_);
     }
 
     ShmControlBlock *cb_;
@@ -134,7 +134,7 @@ public:
         if (shm_fd == -1)
             handle_error("shm_open");
 
-        size_t shm_size = sizeof(ShmControlBlock) + sizeof(T) * capacity;
+        size_t shm_size = sizeof *this->cb_ + sizeof(T) * capacity;
         if constexpr (IsProducer) {
             if (ftruncate(shm_fd, shm_size) == -1)
                 handle_error("ftruncate");
@@ -152,7 +152,7 @@ public:
     }
 
     ~PShmCircularBuffer() {
-        munmap(this->cb_, sizeof(ShmControlBlock) + sizeof(T) * this->cb_->cap);
+        munmap(this->cb_, sizeof *this->cb_ + sizeof(T) * this->cb_->cap);
         if constexpr (IsProducer) {
             shm_unlink(shm_name_.c_str());
         }
@@ -193,7 +193,7 @@ public:
         //      echo `id -g $(whoami)` | sudo tee /proc/sys/vm/hugetlb_shm_group
         // See more at https://www.kernel.org/doc/html/latest/admin-guide/mm/hugetlbpage.html
         if constexpr (IsProducer) {
-            size_t shm_size = sizeof(ShmControlBlock) + sizeof(T) * capacity;
+            size_t shm_size = sizeof *this->cb_ + sizeof(T) * capacity;
             int huge_tlb_flag = use_huge_pages ? SHM_HUGETLB : 0;
             shm_id_ = shmget(key, shm_size, huge_tlb_flag | IPC_CREAT | IPC_EXCL | 0600);
             if (shm_id_ == -1)
@@ -247,7 +247,7 @@ public:
         if (shm_fd == -1)
             handle_error("shm_open");
 
-        size_t shm_size = sizeof(ShmControlBlockLockFree) + sizeof(T) * capacity;
+        size_t shm_size = sizeof *cb_ + sizeof(T) * capacity;
         if constexpr (IsProducer) {
             if (ftruncate(shm_fd, shm_size) == -1)
                 handle_error("ftruncate");
@@ -255,7 +255,7 @@ public:
             // consumer can read the capacity from the shared memory
             ssize_t nbytes = read(shm_fd, &capacity, sizeof capacity);
             assert(nbytes == sizeof capacity);
-            shm_size = sizeof(ShmControlBlockLockFree) + sizeof(T) * capacity;
+            shm_size = sizeof *cb_ + sizeof(T) * capacity;
         }
 
         int write_flag = IsProducer ? PROT_WRITE : 0;
@@ -269,8 +269,7 @@ public:
             cb_->cap_ = capacity;
             cb_->tail_.store(0, std::memory_order_relaxed);
         }
-        buffer_ =
-            reinterpret_cast<T *>(static_cast<char *>(shmp) + sizeof(ShmControlBlockLockFree));
+        buffer_ = reinterpret_cast<T *>(static_cast<char *>(shmp) + sizeof *cb_);
     }
 
     ~PShmBBufferLockFree() {
@@ -279,7 +278,7 @@ public:
             shm_unlink(shm_name_.c_str());
             this->cb_->writer_finished_ = true;
         }
-        munmap(this->cb_, sizeof(ShmControlBlockLockFree) + sizeof(T) * this->cb_->cap_);
+        munmap(this->cb_, sizeof *cb_ + sizeof(T) * this->cb_->cap_);
     }
 
     // producer appends an item to the buffer tail
@@ -332,6 +331,109 @@ private:
     T *buffer_;
     idx_t head_ = 0;
     idx_t cached_tail_ = 0;
+};
+
+struct ShmControlBlockGiacomoni {
+    idx_t cap_;
+    bool writer_finished_;
+};
+
+// Giacomoni et al. [PPoPP 2008]
+// See https://www.youtube.com/watch?v=74QjNwYAJ7M
+template <typename T, bool IsProducer>
+class PShmBBufferGiacomoni {
+public:
+    explicit PShmBBufferGiacomoni(const char *shm_name, idx_t capacity = 0) : shm_name_(shm_name) {
+        static_assert(std::is_trivially_copyable_v<T>, "T must be trivially copyable");
+
+        int shm_fd = -1;
+        if constexpr (IsProducer) {
+            shm_fd = shm_open(shm_name, O_CREAT | O_EXCL | O_RDWR, 0600);
+        } else {
+            shm_fd = shm_open(shm_name, O_RDONLY, 0600);
+        }
+        if (shm_fd == -1)
+            handle_error("shm_open");
+
+        size_t shm_size = sizeof *cb_ + sizeof *produced_ * capacity + sizeof(T) * capacity;
+        if constexpr (IsProducer) {
+            // `produced_` array is initialized to null bytes ('\0') by ftruncate
+            if (ftruncate(shm_fd, shm_size) == -1)
+                handle_error("ftruncate");
+        } else {
+            // consumer can read the capacity from the shared memory
+            ssize_t nbytes = read(shm_fd, &capacity, sizeof capacity);
+            assert(nbytes == sizeof capacity);
+            shm_size = sizeof *cb_ + sizeof *produced_ * capacity + sizeof(T) * capacity;
+        }
+
+        constexpr int flags = IsProducer ? (PROT_READ | PROT_WRITE) : PROT_READ;
+        void *shmp = mmap(nullptr, shm_size, flags, MAP_SHARED, shm_fd, 0);
+        if (shmp == MAP_FAILED)
+            handle_error("mmap");
+
+        cb_ = static_cast<ShmControlBlockGiacomoni *>(shmp);
+        if constexpr (IsProducer) {
+            cb_->cap_ = capacity;
+            cb_->writer_finished_ = false;
+        }
+        produced_ = reinterpret_cast<std::atomic<bool> *>(&cb_[1]);
+        buffer_ = reinterpret_cast<T *>(&produced_[capacity]);
+    }
+
+    ~PShmBBufferGiacomoni() {
+        if constexpr (IsProducer) {
+            shm_unlink(shm_name_.c_str());
+            cb_->writer_finished_ = true;
+        }
+        munmap(produced_, sizeof *cb_ + sizeof *produced_ * cb_->cap_ + sizeof(T) * cb_->cap_);
+    }
+
+    // producer appends an item to the buffer tail
+    // returns false if the buffer is full
+    bool produce(const T &item) {
+        static_assert(IsProducer, "can only be called from producers");
+
+        if (tail_ == cb_->cap_)
+            return false;
+
+        memcpy(&buffer_[tail_], &item, sizeof item);
+        produced_[tail_].store(true, std::memory_order_release);
+        tail_++;
+        return true;
+    }
+
+    // consumer retrieves an item from the buffer head
+    int consume(T &item) {
+        static_assert(!IsProducer, "can only be called from consumers");
+
+        if (cb_->writer_finished_) {
+            if (!produced_[head_].load(std::memory_order_relaxed))
+                return CONSUME_FINISHED;
+        } else {
+            // no cache line bouncing unless head_ and tail_ are pointing to the same cache line
+            if (!produced_[head_].load(std::memory_order_acquire))
+                return CONSUME_AGAIN;
+        }
+
+        memcpy(&item, &buffer_[head_], sizeof item);
+        head_++;
+        return CONSUME_SUCCESS;
+    }
+
+    idx_t capacity() const { return cb_->cap_; }
+
+private:
+    const std::string shm_name_;
+
+    ShmControlBlockGiacomoni *cb_;
+    std::atomic<bool> *produced_;
+    T *buffer_;
+
+    // align to cache lines to avoid false sharing if consumers and producers share
+    // the same address space (e.g., as different threads of the same process)
+    CACHELINE_ALIGNED idx_t head_ = 0;
+    CACHELINE_ALIGNED idx_t tail_ = 0;
 };
 
 }  // namespace shm_spmc

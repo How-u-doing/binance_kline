@@ -7,7 +7,8 @@
 #include <cstdlib>
 
 template <typename T>
-using ShmProducer = shm_spmc::PShmBBufferLockFree<T, /* IsProducer = */ true>;
+// using ShmProducer = shm_spmc::PShmBBufferLockFree<T, /* IsProducer = */ true>;
+using ShmProducer = shm_spmc::PShmBBufferGiacomoni<T, /* IsProducer = */ true>;
 
 void fill_data(KLineData &data, int k, int t) {
     static std::random_device rd;
