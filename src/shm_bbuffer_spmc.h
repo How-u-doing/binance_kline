@@ -357,7 +357,7 @@ public:
         if (shm_fd == -1)
             handle_error("shm_open");
 
-        size_t shm_size = sizeof *cb_ + sizeof *produced_ * capacity + sizeof(T) * capacity;
+        size_t shm_size = get_shm_size(capacity);
         if constexpr (IsProducer) {
             // `produced_` array is initialized to null bytes ('\0') by ftruncate
             if (ftruncate(shm_fd, shm_size) == -1)
@@ -366,7 +366,7 @@ public:
             // consumer can read the capacity from the shared memory
             ssize_t nbytes = read(shm_fd, &capacity, sizeof capacity);
             assert(nbytes == sizeof capacity);
-            shm_size = sizeof *cb_ + sizeof *produced_ * capacity + sizeof(T) * capacity;
+            shm_size = get_shm_size(capacity);
         }
 
         constexpr int flags = IsProducer ? (PROT_READ | PROT_WRITE) : PROT_READ;
@@ -380,7 +380,7 @@ public:
             cb_->writer_finished_ = false;
         }
         produced_ = reinterpret_cast<std::atomic<bool> *>(&cb_[1]);
-        buffer_ = reinterpret_cast<T *>(&produced_[capacity]);
+        buffer_ = reinterpret_cast<T *>(&produced_[produced_len(capacity)]);
     }
 
     ~PShmBBufferGiacomoni() {
@@ -388,7 +388,7 @@ public:
             shm_unlink(shm_name_.c_str());
             cb_->writer_finished_ = true;
         }
-        munmap(produced_, sizeof *cb_ + sizeof *produced_ * cb_->cap_ + sizeof(T) * cb_->cap_);
+        munmap(produced_, get_shm_size(cb_->cap_));
     }
 
     // producer appends an item to the buffer tail
@@ -410,7 +410,7 @@ public:
         static_assert(!IsProducer, "can only be called from consumers");
 
         if (cb_->writer_finished_) {
-            if (head_ == cb_->cap_ || !produced_[head_].load(std::memory_order_relaxed))
+            if (!produced_[head_].load(std::memory_order_relaxed))
                 return CONSUME_FINISHED;
         } else {
             // no cache coherence protocol overhead unless head_ and tail_ are pointing to
@@ -427,6 +427,19 @@ public:
     idx_t capacity() const { return cb_->cap_; }
 
 private:
+    static idx_t round_up(idx_t n, idx_t alignment) {
+        return ((n + alignment - 1) / alignment) * alignment;
+    }
+
+    static idx_t produced_len(idx_t cap) {
+        // one extra element is used as a sentinel to avoid a branch in consume()
+        return round_up(cap + 1, alignof(T));
+    }
+
+    size_t get_shm_size(idx_t cap) const {
+        return sizeof *cb_ + sizeof *produced_ * produced_len(cap) + sizeof(T) * cap;
+    }
+
     const std::string shm_name_;
 
     ShmControlBlockGiacomoni *cb_;
