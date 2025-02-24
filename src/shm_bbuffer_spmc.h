@@ -411,7 +411,8 @@ public:
             if (head_ == cb_->cap_ || !produced_[head_].load(std::memory_order_relaxed))
                 return CONSUME_FINISHED;
         } else {
-            // no cache line bouncing unless head_ and tail_ are pointing to the same cache line
+            // no cache coherence protocol overhead unless head_ and tail_ are pointing to
+            // the same cache line
             if (!produced_[head_].load(std::memory_order_acquire))
                 return CONSUME_AGAIN;
         }
