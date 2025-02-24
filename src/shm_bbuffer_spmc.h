@@ -267,7 +267,9 @@ public:
         cb_ = static_cast<ShmControlBlockLockFree *>(shmp);
         if constexpr (IsProducer) {
             cb_->cap_ = capacity;
+            // ftruncate() already zeroed the memory, here for clarity
             cb_->tail_.store(0, std::memory_order_relaxed);
+            cb_->writer_finished_ = false;
         }
         buffer_ = reinterpret_cast<T *>(static_cast<char *>(shmp) + sizeof *cb_);
     }
@@ -276,9 +278,9 @@ public:
         if constexpr (IsProducer) {
             // destroys the shared object only when all processes have unmapped it
             shm_unlink(shm_name_.c_str());
-            this->cb_->writer_finished_ = true;
+            cb_->writer_finished_ = true;
         }
-        munmap(this->cb_, sizeof *cb_ + sizeof(T) * this->cb_->cap_);
+        munmap(cb_, sizeof *cb_ + sizeof(T) * cb_->cap_);
     }
 
     // producer appends an item to the buffer tail
