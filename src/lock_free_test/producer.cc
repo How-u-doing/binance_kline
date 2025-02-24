@@ -10,11 +10,11 @@ template <typename T>
 // using ShmProducer = shm_spmc::PShmBBufferLockFree<T, /* IsProducer = */ true>;
 using ShmProducer = shm_spmc::PShmBBufferGiacomoni<T, /* IsProducer = */ true>;
 
-void fill_data(KLineData &data, int k, int t) {
-    static std::random_device rd;
-    static std::mt19937 gen(rd());
-    static std::uniform_int_distribution<int> dis(0, 20);
+std::random_device rd;
+std::mt19937 gen(rd());
+std::uniform_int_distribution<int> dis(0, 20);
 
+void fill_data(KLineData &data, int k, int t) {
     int rand = dis(gen);
 
     data.sym_id = k;
@@ -28,6 +28,7 @@ void fill_data(KLineData &data, int k, int t) {
 }
 
 void produce_data(ShmProducer<KLineData> &shm_buffer, int sym_cnt) {
+    gen.seed(12345);  // set seed for reproducibility
     KLineData data;
 
     constexpr int delta_print_time = 10'00'000;  // every 10 min
