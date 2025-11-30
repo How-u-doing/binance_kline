@@ -238,28 +238,27 @@ public:
     explicit PShmBBufferLockFree(const char *shm_name, idx_t capacity = 0) : shm_name_(shm_name) {
         static_assert(std::is_trivially_copyable_v<T>, "T must be trivially copyable");
 
-        int shm_fd = -1;
         if constexpr (IsProducer) {
-            shm_fd = shm_open(shm_name, O_CREAT | O_EXCL | O_RDWR, 0600);
+            shm_fd_ = shm_open(shm_name, O_CREAT | O_EXCL | O_RDWR, 0600);
         } else {
-            shm_fd = shm_open(shm_name, O_RDONLY, 0600);
+            shm_fd_ = shm_open(shm_name, O_RDONLY, 0600);
         }
-        if (shm_fd == -1)
+        if (shm_fd_ == -1)
             handle_error("shm_open");
 
         size_t shm_size = sizeof *cb_ + sizeof(T) * capacity;
         if constexpr (IsProducer) {
-            if (ftruncate(shm_fd, shm_size) == -1)
+            if (ftruncate(shm_fd_, shm_size) == -1)
                 handle_error("ftruncate");
         } else {
             // consumer can read the capacity from the shared memory
-            ssize_t nbytes = read(shm_fd, &capacity, sizeof capacity);
+            ssize_t nbytes = read(shm_fd_, &capacity, sizeof capacity);
             assert(nbytes == sizeof capacity);
             shm_size = sizeof *cb_ + sizeof(T) * capacity;
         }
 
         int write_flag = IsProducer ? PROT_WRITE : 0;
-        void *shmp = mmap(nullptr, shm_size, PROT_READ | write_flag, MAP_SHARED, shm_fd, 0);
+        void *shmp = mmap(nullptr, shm_size, PROT_READ | write_flag, MAP_SHARED, shm_fd_, 0);
         if (shmp == MAP_FAILED)
             handle_error("mmap");
 
@@ -270,17 +269,26 @@ public:
             // ftruncate() already zeroed the memory, here for clarity
             cb_->tail_.store(0, std::memory_order_relaxed);
             cb_->writer_finished_ = false;
+        } else {
+            // consumers can close fd after mmap, the producer keeps it open for ftruncate in dtor
+            close(shm_fd_);
         }
         buffer_ = reinterpret_cast<T *>(static_cast<char *>(shmp) + sizeof *cb_);
     }
 
     ~PShmBBufferLockFree() {
+        size_t shm_size = sizeof *cb_ + sizeof(T) * cb_->cap_;
         if constexpr (IsProducer) {
-            // destroys the shared object only when all processes have unmapped it
-            shm_unlink(shm_name_.c_str());
+            // truncate the shared memory object to its actual size
+            cb_->cap_ = cb_->tail_.load(std::memory_order_relaxed);
+            if (ftruncate(shm_fd_, sizeof *cb_ + sizeof(T) * cb_->cap_) == -1)
+                handle_error("ftruncate");
+            close(shm_fd_);
             cb_->writer_finished_ = true;
+            // destroys the shared object only when all processes have unmapped it
+            // shm_unlink(shm_name_.c_str());
         }
-        munmap(cb_, sizeof *cb_ + sizeof(T) * cb_->cap_);
+        munmap(cb_, shm_size);
     }
 
     // producer appends an item to the buffer tail
@@ -329,6 +337,8 @@ public:
 
 private:
     const std::string shm_name_;
+    int shm_fd_;
+
     ShmControlBlockLockFree *cb_;
     T *buffer_;
     idx_t head_ = 0;
@@ -348,29 +358,28 @@ public:
     explicit PShmBBufferGiacomoni(const char *shm_name, idx_t capacity = 0) : shm_name_(shm_name) {
         static_assert(std::is_trivially_copyable_v<T>, "T must be trivially copyable");
 
-        int shm_fd = -1;
         if constexpr (IsProducer) {
-            shm_fd = shm_open(shm_name, O_CREAT | O_EXCL | O_RDWR, 0600);
+            shm_fd_ = shm_open(shm_name, O_CREAT | O_EXCL | O_RDWR, 0600);
         } else {
-            shm_fd = shm_open(shm_name, O_RDONLY, 0600);
+            shm_fd_ = shm_open(shm_name, O_RDONLY, 0600);
         }
-        if (shm_fd == -1)
+        if (shm_fd_ == -1)
             handle_error("shm_open");
 
         size_t shm_size = get_shm_size(capacity);
         if constexpr (IsProducer) {
             // `produced_` array is initialized to null bytes ('\0') by ftruncate
-            if (ftruncate(shm_fd, shm_size) == -1)
+            if (ftruncate(shm_fd_, shm_size) == -1)
                 handle_error("ftruncate");
         } else {
             // consumer can read the capacity from the shared memory
-            ssize_t nbytes = read(shm_fd, &capacity, sizeof capacity);
+            ssize_t nbytes = read(shm_fd_, &capacity, sizeof capacity);
             assert(nbytes == sizeof capacity);
             shm_size = get_shm_size(capacity);
         }
 
         constexpr int flags = IsProducer ? (PROT_READ | PROT_WRITE) : PROT_READ;
-        void *shmp = mmap(nullptr, shm_size, flags, MAP_SHARED, shm_fd, 0);
+        void *shmp = mmap(nullptr, shm_size, flags, MAP_SHARED, shm_fd_, 0);
         if (shmp == MAP_FAILED)
             handle_error("mmap");
 
@@ -378,17 +387,25 @@ public:
         if constexpr (IsProducer) {
             cb_->cap_ = capacity;
             cb_->writer_finished_ = false;
+        } else {
+            // consumers can close fd after mmap, the producer keeps it open for ftruncate in dtor
+            close(shm_fd_);
         }
         produced_ = reinterpret_cast<std::atomic<bool> *>(&cb_[1]);
         buffer_ = reinterpret_cast<T *>(&produced_[produced_len(capacity)]);
     }
 
     ~PShmBBufferGiacomoni() {
+        size_t shm_size = get_shm_size(cb_->cap_);
         if constexpr (IsProducer) {
-            shm_unlink(shm_name_.c_str());
+            // truncate the shared memory object to its actual size
+            if (ftruncate(shm_fd_, get_shm_size(cb_->cap_, tail_)) == -1)
+                handle_error("ftruncate");
+            close(shm_fd_);
             cb_->writer_finished_ = true;
+            // shm_unlink(shm_name_.c_str());
         }
-        munmap(produced_, get_shm_size(cb_->cap_));
+        munmap(cb_, shm_size);
     }
 
     // producer appends an item to the buffer tail
@@ -440,7 +457,12 @@ private:
         return sizeof *cb_ + sizeof *produced_ * produced_len(cap) + sizeof(T) * cap;
     }
 
+    size_t get_shm_size(idx_t cap, idx_t cnt) const {
+        return sizeof *cb_ + sizeof *produced_ * produced_len(cap) + sizeof(T) * cnt;
+    }
+
     const std::string shm_name_;
+    int shm_fd_;
 
     ShmControlBlockGiacomoni *cb_;
     std::atomic<bool> *produced_;
