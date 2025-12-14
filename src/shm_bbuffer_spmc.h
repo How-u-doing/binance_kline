@@ -317,6 +317,14 @@ public:
 #if 1
             // If the reader is slower than the writer, caching the tail can significantly
             // reduce the # of loads of `tail_`, which the writer updates frequently.
+            //
+            // Consider the MESI protocol: A reader core that loads `tail_` will cause the cache
+            // line in the writer core to transition from MODIFIED to SHARED state.  The writer
+            // core needs to send the content of the cache line to the bus, which will be consumed
+            // by other cores requesting this cache line, as well as by the main memory (slow).
+            // Next time when the writer core attempts to store to `tail_`, it has to send a
+            // "Request For Ownership" (RFO) message, which requires all copies of the cache line
+            // in other cores to be invalidated. These cost! So caching `tail_` can be beneficial.
             if (head_ == cached_tail_) {
                 cached_tail_ = cb_->tail_.load(std::memory_order_acquire);
                 if (head_ == cached_tail_)
